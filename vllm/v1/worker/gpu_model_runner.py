@@ -3,7 +3,7 @@
 import gc
 import time
 import weakref
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, List
 
 import numpy as np
 import torch
@@ -1185,8 +1185,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         attn_metadata: Optional[FlashAttentionMetadata] = None,
     ) -> torch.Tensor:
         model = self.model
-        if kv_caches is None:
-            kv_caches = self.kv_caches
         if self.is_multimodal_model:
             input_ids = None
             inputs_embeds = self.inputs_embeds[:num_tokens]
@@ -1200,7 +1198,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states = model(
                 input_ids=input_ids,
                 positions=positions,
-                kv_caches=kv_caches,
                 attn_metadata=None,
                 inputs_embeds=inputs_embeds,
             )
