@@ -3268,8 +3268,8 @@ class CompilationConfig(BaseModel):
         # NOTE: this function needs to be called
         if not self.splitting_ops:
             self.splitting_ops = [
-                "vllm.unified_attention",
-                "vllm.unified_attention_with_output",
+                # "vllm.unified_attention",
+                # "vllm.unified_attention_with_output",
             ]
 
 

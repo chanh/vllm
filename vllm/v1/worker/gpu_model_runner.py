@@ -3,7 +3,7 @@
 import gc
 import time
 import weakref
-from typing import TYPE_CHECKING, Optional, Union, List
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import torch
@@ -177,7 +177,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=model_config.get_vocab_size(),
         )
 
-        self.use_cuda_graph = not self.model_config.enforce_eager
+        self.use_cuda_graph = (self.vllm_config.compilation_config.level
+                               == CompilationLevel.PIECEWISE
+                               and not self.model_config.enforce_eager)
         # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
         # The convention is different.
         # self.cudagraph_batch_sizes sorts in ascending order.
@@ -224,20 +226,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.inputs_embeds = torch.zeros(
             (self.max_num_tokens, self.hidden_size),
             dtype=self.dtype,
-            device=self.device)
-
-        # Attention metadata related persistent buffers
-        self.query_start_loc = torch.zeros(self.max_num_reqs + 1,
-                                           dtype=torch.int32,
-                                           device=self.device)
-        self.seq_lens = torch.zeros(self.max_num_reqs,
-                                    dtype=torch.int32,
-                                    device=self.device)
-        self.slot_mapping = torch.zeros(
-            self.max_num_tokens,
-            # CPU slot_mapping is int32, but
-            # this one must be int64
-            dtype=torch.int64,
             device=self.device)
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
@@ -578,19 +566,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.positions_cpu[:total_num_scheduled_tokens],
                 non_blocking=True)
 
-        self.query_start_loc[:num_reqs + 1].copy_(
-            self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
-        self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
-                                       non_blocking=True)
-        self.slot_mapping[:total_num_scheduled_tokens].copy_(
-            self.slot_mapping_cpu[:total_num_scheduled_tokens],
-            non_blocking=True)
-
-        # Fill unused with -1. Needed for reshape_and_cache
-        self.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
-        self.seq_lens[num_reqs:].fill_(0)
-        self.query_start_loc[num_reqs + 1:].fill_(-1)
-
         # Prepare for cascade attention if enabled & beneficial.
         common_prefix_len = 0
         if self.cascade_attn_enabled:
@@ -603,23 +578,122 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs=num_reqs,
             num_actual_tokens=total_num_scheduled_tokens,
             max_query_len=max_num_scheduled_tokens,
-            query_start_loc=self.query_start_loc[:num_reqs + 1],
-            max_seq_len=max_seq_len,
-            seq_lens=self.seq_lens[:num_reqs],
-            block_table=(
-                self.input_batch.block_table.get_device_tensor()[:num_reqs]),
-            slot_mapping=self.slot_mapping[:total_num_scheduled_tokens],
-            # Cascade stuff
-            use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
         )
-        # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
-        # request in the batch. While we should not sample any token from this
-        # partial request, we do so for simplicity. We will ignore the sampled
-        # token from the partial request.
-        # TODO: Support prompt logprobs.
-        logits_indices = self.query_start_loc[1:num_reqs + 1] - 1
-        return attn_metadata, logits_indices
+
+        use_spec_decode = len(
+            scheduler_output.scheduled_spec_decode_tokens) > 0
+        if not use_spec_decode:
+            # NOTE(woosuk): Due to chunked prefills, the batch may contain
+            # partial requests. While we should not sample any token
+            # from these partial requests, we do so for simplicity.
+            # We will ignore the sampled tokens from the partial requests.
+            # TODO: Support prompt logprobs.
+            logits_indices = attn_metadata.query_start_loc[1:] - 1
+            spec_decode_metadata = None
+        else:
+            # Get the number of draft tokens for each request.
+            # Iterate over the dictionary rather than all requests since not all
+            # requests have draft tokens.
+            num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+            for req_id, draft_token_ids in (
+                    scheduler_output.scheduled_spec_decode_tokens.items()):
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                num_draft_tokens[req_idx] = len(draft_token_ids)
+
+            spec_decode_metadata = self._calc_spec_decode_metadata(
+                num_draft_tokens, cu_num_tokens)
+            logits_indices = spec_decode_metadata.logits_indices
+
+        # Hot-Swap lora model
+        if self.lora_config:
+            self.set_active_loras(self.input_batch, num_scheduled_tokens)
+
+        return attn_metadata, logits_indices, spec_decode_metadata
+
+    def _compute_cascade_attn_prefix_len(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        num_common_prefix_blocks: int,
+    ) -> int:
+        """Compute the length of the common prefix for cascade attention.
+
+        NOTE(woosuk): The common prefix length returned by this function
+        represents the length used specifically for cascade attention, not the
+        actual number of tokens shared between requests. When cascade attention
+        is disabled (use_cascade=False), this function returns 0 even if
+        requests share common tokens. Additionally, the common prefix length is
+        truncated to a multiple of the block size and may be further truncated
+        due to implementation details explained below.
+
+        Args:
+            num_scheduled_tokens: Number of tokens scheduled per request.
+            num_common_prefix_blocks: Number of shared KV cache blocks.
+
+        Returns:
+            int: Length of common prefix in tokens.
+        """
+        common_prefix_len = num_common_prefix_blocks * self.block_size
+        if common_prefix_len == 0:
+            # Common case.
+            return 0
+
+        # NOTE(woosuk): Cascade attention uses two attention kernels: one
+        # for the common prefix and the other for the rest. For the first
+        # kernel, we concatenate all the query tokens (possibly from
+        # different requests) and treat them as if they are from the same
+        # request. Then, we use bi-directional attention to process the
+        # common prefix in the KV cache. Importantly, this means that the
+        # first kernel does not do any masking.
+
+        # Consider the following example:
+        # Request 1's input query: [D, E, X]
+        # Request 1's kv cache: [A, B, C, D, E, X]
+        # Request 1's num_computed_tokens: 3 (i.e., [A, B, C])
+        # Request 2's input query: [E, Y]
+        # Request 2's kv cache: [A, B, C, D, E, Y]
+        # Request 2's num_computed_tokens: 4 (i.e., [A, B, C, D])
+
+        # If we use [A, B, C, D, E] as the common prefix, then the
+        # first kernel will compute the bi-directional attention between
+        # input query [D, E, X, E, Y] and common prefix [A, B, C, D, E].
+        # However, this is wrong because D in Request 1 should not attend to
+        # E in the common prefix (i.e., we need masking).
+        # To avoid this, [A, B, C, D] should be the common prefix.
+        # That is, the common prefix should be capped by the minimum
+        # num_computed_tokens among the requests, and plus one to include
+        # the first token of the query.
+
+        # In practice, we use [A, B, C] as the common prefix, instead of
+        # [A, B, C, D] (i.e., the common prefix is capped by the minimum
+        # num_computed_tokens, without plus one).
+        # This is because of an implementation detail: We want to always
+        # use two kernels for cascade attention. Let's imagine:
+        # Request 3's input query: [D]
+        # Request 3's kv cache: [A, B, C, D]
+        # Request 3's num_computed_tokens: 4 (i.e., [A, B, C, D])
+        # If we use [A, B, C, D] as the common prefix for Request 1-3,
+        # then Request 3 will be processed only by the first kernel,
+        # and the second kernel will get an empty input. While this is not
+        # a fundamental problem, our current implementation does not support
+        # this case.
+        num_reqs = len(num_scheduled_tokens)
+        common_prefix_len = min(
+            common_prefix_len,
+            self.input_batch.num_computed_tokens_cpu[:num_reqs].min())
+        # common_prefix_len should be a multiple of the block size.
+        common_prefix_len = (common_prefix_len // self.block_size *
+                             self.block_size)
+        use_cascade = self.attn_backend.use_cascade_attention(
+            common_prefix_len=common_prefix_len,
+            query_lens=num_scheduled_tokens,
+            num_query_heads=self.num_query_heads,
+            num_kv_heads=self.num_kv_heads,
+            use_alibi=False,  # FIXME
+            use_sliding_window=self.window_size is not None,
+            num_sms=self.num_sms,
+        )
+        return common_prefix_len if use_cascade else 0
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         mrope_pos_ptr = 0
@@ -1181,49 +1255,135 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _dummy_run(
         self,
         num_tokens: int,
-        kv_caches: Optional[List[torch.Tensor]] = None,
-        attn_metadata: Optional[FlashAttentionMetadata] = None,
     ) -> torch.Tensor:
-        model = self.model
-        if self.is_multimodal_model:
-            input_ids = None
-            inputs_embeds = self.inputs_embeds[:num_tokens]
-        else:
-            input_ids = self.input_ids[:num_tokens]
-            inputs_embeds = None
-        with set_forward_context(attn_metadata, self.vllm_config):
-            positions = self.mrope_positions[:, :num_tokens] \
-                if self.model_config.uses_mrope \
-                else self.positions[:num_tokens]
-            hidden_states = model(
-                input_ids=input_ids,
-                positions=positions,
-                attn_metadata=None,
-                inputs_embeds=inputs_embeds,
+
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = max_num_reqs if num_tokens >= max_num_reqs else num_tokens
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list,
+                                        dtype=np.int32)
+
+        with self.maybe_dummy_run_with_lora(self.lora_config,
+                                            num_scheduled_tokens):
+            model = self.model
+            if self.is_multimodal_model:
+                input_ids = None
+                inputs_embeds = self.inputs_embeds[:num_tokens]
+            else:
+                input_ids = self.input_ids[:num_tokens]
+                inputs_embeds = None
+            if self.uses_mrope:
+                positions = self.mrope_positions[:, :num_tokens]
+            else:
+                positions = self.positions[:num_tokens]
+
+            if get_pp_group().is_first_rank:
+                intermediate_tensors = None
+            else:
+                if self.intermediate_tensors is None:
+                    self.intermediate_tensors = (
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=self.max_num_tokens,
+                            dtype=self.model_config.dtype,
+                            device=self.device))
+                intermediate_tensors = IntermediateTensors({
+                    k: v[:num_tokens]
+                    for k, v in self.intermediate_tensors.items()
+                })
+
+            with set_forward_context(None,
+                                     self.vllm_config,
+                                     num_tokens=num_tokens):
+                hidden_states = model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+
+        logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        return hidden_states[logit_indices]
+
+    @torch.inference_mode()
+    def _dummy_sampler_run(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+
+        logits = self.model.compute_logits(hidden_states, None)
+        num_reqs = logits.size(0)
+
+        dummy_tensors = lambda v: torch.full(
+            (num_reqs, ), v, device=self.device)
+
+        dummy_metadata = SamplingMetadata(
+            temperature=dummy_tensors(0.5),
+            all_greedy=False,
+            all_random=False,
+            top_p=dummy_tensors(0.9),
+            top_k=dummy_tensors(logits.size(1) - 1),
+            min_p=None,
+            generators={},
+            max_num_logprobs=None,
+            no_penalties=True,
+            prompt_token_ids=None,
+            frequency_penalties=dummy_tensors(0.1),
+            presence_penalties=dummy_tensors(0.1),
+            repetition_penalties=dummy_tensors(0.1),
+            output_token_ids=[[] for _ in range(num_reqs)],
+            min_tokens={},
+            logit_bias=[None for _ in range(num_reqs)],
+            allowed_token_ids_mask=None,
+            bad_words_token_ids={},
+        )
+        try:
+            sampler_output = self.model.sample(
+                logits=logits, sampling_metadata=dummy_metadata)
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
+                raise RuntimeError(
+                    "CUDA out of memory occurred when warming up sampler with "
+                    f"{num_reqs} dummy requests. Please try lowering "
+                    "`max_num_seqs` or `gpu_memory_utilization` when "
+                    "initializing the engine.") from e
+            else:
+                raise e
+        if self.use_spec_decode:
+            draft_token_ids = [[0] for _ in range(num_reqs)]
+            dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+                draft_token_ids, self.device)
+
+            num_tokens = sum(len(ids) for ids in draft_token_ids)
+            # draft_probs = torch.randn(
+            #     num_tokens, logits.shape[-1], device=self.device,
+            #     dtype=logits.dtype)
+            draft_probs = None
+            target_logits = torch.randn(num_tokens,
+                                        logits.shape[-1],
+                                        device=self.device,
+                                        dtype=logits.dtype)
+            # NOTE(woosuk): Here, we should use int32 because the sampler uses
+            # int32 for bonus_token_ids. If the dtype mismatches, re-compilation
+            # will occur at runtime.
+            bonus_token_ids = torch.zeros(num_reqs,
+                                          device=self.device,
+                                          dtype=torch.int32)
+            self.rejection_sampler(
+                dummy_spec_decode_metadata,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                dummy_metadata,
             )
         return sampler_output
-
-    def metadata_for_dummy_run(self, num_tokens) -> FlashAttentionMetadata:
-        # Create placeholder metadata
-        num_reqs = num_tokens
-        max_query_len = num_tokens
-        max_seq_len = num_tokens
-        return FlashAttentionMetadata(
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            query_start_loc=self.query_start_loc[:num_reqs + 1],
-            max_seq_len=max_seq_len,
-            seq_lens=self.seq_lens[:num_reqs],
-            block_table=(
-                self.input_batch.block_table.get_device_tensor()[:num_reqs]),
-            slot_mapping=self.slot_mapping[:max_seq_len],
-            # Cascade stuff. Non-piecewise CUDA graphs NYI
-            use_cascade=False,
-            common_prefix_len=0,
-            cu_prefix_query_lens=None,
-            prefix_kv_lens=None,
-            suffix_kv_lens=None,
-        )
 
     def profile_run(self) -> None:
         # Profile with multimodal encoder & encoder cache.
@@ -1316,6 +1476,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         gc.collect()
 
     def capture_model(self) -> None:
+        if not self.use_cuda_graph:
+            logger.warning(
+                "Skipping CUDA graph capture. Please add "
+                "-O %s to use CUDA graphs.", CompilationLevel.PIECEWISE)
+            return
+
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
@@ -1324,11 +1490,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # can reuse the memory pool allocated for the large shapes.
         with graph_capture(device=self.device):
             for num_tokens in reversed(self.cudagraph_batch_sizes):
-                attn_metadata = self.metadata_for_dummy_run(num_tokens)
                 for _ in range(self.vllm_config.compilation_config.
                                cudagraph_num_of_warmups):
-                    self._dummy_run(num_tokens, attn_metadata=attn_metadata)
-                self._dummy_run(num_tokens, attn_metadata=attn_metadata)
+                    self._dummy_run(num_tokens)
+                self._dummy_run(num_tokens)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]

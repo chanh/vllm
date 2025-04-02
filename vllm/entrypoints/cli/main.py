@@ -11,6 +11,7 @@ import vllm.entrypoints.cli.serve
 import vllm.version
 from vllm.logger import init_logger
 from vllm.utils import FlexibleArgumentParser
+import debugpy
 
 logger = init_logger(__name__)
 
@@ -52,6 +53,7 @@ def env_setup():
 
 
 def main():
+    # debugpy.listen(("localhost", 5678))
     env_setup()
 
     parser = FlexibleArgumentParser(description="vLLM CLI")
